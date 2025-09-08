@@ -1,4 +1,3 @@
-
 python -u -m recipe.gspo_ib.main_ib \
                 algorithm.adv_estimator=grpo \
                 actor_rollout_ref.actor.policy_loss.loss_mode='gspo' \
