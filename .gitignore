@@ -126,3 +126,8 @@ logs
 log
 outputs
 .history
+
+script_note.slurm
+paper.md
+README.md
+my_job_output*

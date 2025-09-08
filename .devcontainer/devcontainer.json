@@ -1,0 +1,73 @@
+{
+    "name": "Verl Dev on Original Image (vLLM 0.8.5)", // 描述性名称
+    //"image": "verlai/verl:app-verl0.5-transformers4.55.4-sglang0.4.10.post2-mcore0.13.0-te2.2", // !! 确保这里是你实际的镜像名和标签 !!
+	"image": "verlai/verl:app-verl0.4-vllm0.8.5-mcore0.13.0-preview", // !! 确保这里是你实际的镜像名和标签 !!
+    // --- 以下是推荐添加或修改的配置 ---
+
+    // 1. 挂载工作区: 通常自动生成且正确，确保项目代码能被访问
+    "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",
+    "workspaceMount": "source=${localWorkspaceFolder},target=/workspaces/${localWorkspaceFolderBasename},type=bind,consistency=cached",
+
+    // 2. 启用 GPU (如果需要): 对于NVIDIA镜像，这通常是必须的
+    "runArgs": [
+        "--gpus", "all",
+        // 如果需要特定的GPU，可以使用 "--gpus", "device=0" 等
+               // --- 添加的挂载点 ---
+        "-v", "D:/model:/model"
+        // --- 结束添加 ---·
+        // 注意:
+        // 1. 路径格式: Docker Desktop on Windows generally handles "D:/path" style paths correctly.
+        //    If you encounter issues, you might try "//d/model" or other Docker path formats,
+        //    but "D:/model" should usually work.
+        // 2. 读写权限: By default, this mount is read-write. If you only need read access
+        //    for the models, you can add ':ro' like this: "-v", "D:/model:/model:ro"
+        // 3. 替代语法 (--mount): You could also use the more verbose --mount syn
+        //    "--mount", "type=bind,source=D:/model,target=/model"
+    ],
+    
+    // 4. ** 容器创建后执行的命令 (核心) **
+    //"postCreateCommand": "pip uninstall -y verl && pip install --no-cache-dir -e /workspaces/verl --index-url https://pypi.tuna.tsinghua.edu.cn/simple",
+    //   - `pip uninstall -y verl`: 卸载原Image中预装的 verl 包
+    //   - `pip install --upgrade "vllm==0.8.5"`: 将 vllm 升级到 0.8.5 (如果原版本不同)
+    //   - `pip install -e /workspaces/verl[dev]`: 以可编辑模式安装你挂载进来的本地 verl 源代码
+    //     (如果 verl 没有 [dev] 依赖，移除 [dev])
+
+    // 3. 端口转发 (如果你的应用需要): 列出容器内需要映射到主机的端口
+    // "forwardPorts": [8000, 5000],
+
+    // 4. VS Code 设置和扩展 (在容器内生效):
+    "customizations": {
+        "vscode": {
+            // 在容器内自动安装的 VS Code 扩展
+            "extensions": [
+                "ms-python.python",         // Python 核心支持
+                "ms-python.debugpy",        // Python 调试器
+                "google.geminicodeassist",
+                "anyscalecompute.ray-distributed-debugger",       // 
+                "github.copilot",       // 
+                "ms-azuretools.vscode-containers",       // 
+            ],
+            // 在容器内的 VS Code 设置
+            "settings": {
+                // 例如，指定容器内的 Python 解释器路径 (通常插件会自动检测)
+                // "python.defaultInterpreterPath": "/usr/bin/python3", // 根据镜像实际情况调整
+                "terminal.integrated.shell.linux": "/bin/bash" // 确保终端是 bash
+            }
+        }
+    },
+
+    // 5. 容器生命周期钩子 (可选):
+    // "postCreateCommand": "pip install -r requirements.txt", // 容器创建后执行的命令
+    // "updateContentCommand": "echo 'Updating content...'", // 每次附加到容器时执行
+    // "postAttachCommand": "echo 'Attached!'", // 每次附加到容器后执行
+
+    // 6. 用户: 默认是 root，可以改为非 root 用户，但这需要镜像支持
+    // "remoteUser": "vscode"
+  "containerEnv": {
+    // 将 7890 替换为您在第 1 步中找到的实际端口号
+    "HTTP_PROXY": "http://host.docker.internal:7890",
+    "HTTPS_PROXY": "http://host.docker.internal:7890",
+    // 有些工具可能还需要设置 no_proxy，以避免代理访问容器内部的其他服务
+    "NO_PROXY": "localhost,127.0.0.1" 
+  }
+}

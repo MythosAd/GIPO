@@ -296,7 +296,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                         with marked_timer("ref", timing_raw, "olive"):
                             ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
-
+        
                     # compute values
                     if self.use_critic:
                         with marked_timer("values", timing_raw, "cyan"):

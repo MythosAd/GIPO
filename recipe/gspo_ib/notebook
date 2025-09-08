@@ -1,0 +1,1 @@
+torch.nonzero(scalar_rewards)

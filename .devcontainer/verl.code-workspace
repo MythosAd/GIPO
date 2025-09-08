@@ -1,0 +1,12 @@
+{
+	"name": "Verl Dev on Original Image (vLLM 0.8.5)",
+	"folders": [
+		{
+			"path": ".."
+		},
+		{
+			"path": "../../../usr/local/lib/python3.10/dist-packages"
+		}
+	],
+	"settings": {}
+}

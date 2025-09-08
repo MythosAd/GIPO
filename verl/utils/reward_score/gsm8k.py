@@ -25,10 +25,12 @@ def extract_solution(solution_str, method="strict"):
     # We only match on the last 300 characters, which is a safe approximation for 300 tokens.
     if len(solution_str) > _SOLUTION_CLIP_CHARS:
         solution_str = solution_str[-_SOLUTION_CLIP_CHARS:]
-
+    
     if method == "strict":
         # this also tests the formatting of the model
-        solutions = re.findall("#### (\\-?[0-9\\.\\,]+)", solution_str)
+        # solutions = re.findall("#### (\\-?[0-9\\.\\,]+)", solution_str)
+        solutions = re.findall("#### (-?\d+(?:\.\d+)?)", solution_str)
+        r"#### (-?\d+(?:\.\d+)?)"
         if len(solutions) == 0:
             final_answer = None
         else:
@@ -62,6 +64,7 @@ def compute_score(solution_str, ground_truth, method="strict", format_score=0.0,
         format_score: the score for the format
         score: the score for the correct answer
     """
+    # breakpoint()
     answer = extract_solution(solution_str=solution_str, method=method)
     if answer is None:
         return 0

@@ -316,6 +316,7 @@ class DataParallelPPOActor(BasePPOActor):
         Returns:
             torch.Tensor: the log_prob tensor
         """
+        # breakpoint()
         # set to eval
         self.actor_module.eval()
 

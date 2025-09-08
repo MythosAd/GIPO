@@ -1,0 +1,18 @@
+
+
+curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo bash -
+sudo apt-get install -y nodejs
+node --version
+
+npm install -g @anthropic-ai/claude-code
+
+
+
+ANTHROPIC_BASE_URL= moonshotai/kimi-2-instruct
+ANTHROPIC_
+
+export ANTHROPIC_BASE_URL="https://api.moonshot.cn/anthropic/"
+export ANTHROPIC_AUTH_TOKEN="sk-21TijPAxLAjvZV9JUnzveUQiELz2fXmfESVM4m82eIUqafcu"
+
+
+npm install -g @google/gemini-cli

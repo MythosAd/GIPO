@@ -1,0 +1,564 @@
+import os
+import math
+import torch
+from datasets import load_dataset
+from torch.utils.data import DataLoader, Dataset
+from transformers import (
+    Qwen2Config,
+    Qwen2ForCausalLM,
+    Qwen2Tokenizer,
+    get_cosine_schedule_with_warmup,
+)
+from tqdm import tqdm
+
+
+class MoonDataset(Dataset):
+    def __init__(self, dataset_name, dataset, tokenizer, max_length=512):
+        self.dataset_name = dataset_name
+        self.dataset = dataset
+        self.tokenizer = tokenizer
+        self.texts = dataset["train"]["text"]
+        self.max_length = max_length
+        self.tokens = []
+        self._tokenize_texts()
+
+    def _tokenize_texts(self):
+        if os.path.exists(f"{self.dataset_name}.bin"):
+            self.tokens = torch.load(f"{self.dataset_name}.bin")
+        else:
+            for text in tqdm(self.texts, desc="Tokenizing texts"):
+                encoded = self.tokenizer.encode(text, add_special_tokens=True)
+                self.tokens.extend(encoded)
+            torch.save(self.tokens, f"{self.dataset_name}.bin")
+
+    def __len__(self):
+        return len(self.tokens) // self.max_length
+
+    def __getitem__(self, idx):
+        start_idx = idx * (self.max_length)
+        end_idx = start_idx + (self.max_length)
+        token_slice = self.tokens[start_idx:end_idx]
+        data = torch.tensor(token_slice, dtype=torch.long)
+        return data
+
+
+# This code snippet is a modified version adapted from the following GitHub repository:
+# https://github.com/KellerJordan/Muon/blob/master/muon.py
+@torch.compile
+def zeropower_via_newtonschulz5(G, steps): 
+    """
+    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
+    quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
+    of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
+    zero even beyond the point where the iteration no longer converges all the way to one everywhere
+    on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
+    where S' is diagonal with S_{ii}' ~ Uniform(0.5, 1.5), which turns out not to hurt model
+    performance at all relative to UV^T, where USV^T = G is the SVD.
+    """
+    assert len(G.shape) == 2
+    a, b, c = (3.4445, -4.7750, 2.0315)
+    X = G.bfloat16()
+    if G.size(0) > G.size(1):
+        X = X.T
+    # Ensure spectral norm is at most 1
+    X = X / (X.norm() + 1e-7)
+    # Perform the NS iterations
+    for _ in range(steps):
+        A = X @ X.T
+        B = (
+            b * A + c * A @ A
+        )  # adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
+        X = a * X + B @ X
+
+    if G.size(0) > G.size(1):
+        X = X.T
+    return X
+
+def get_dynamic_coefficients(t):
+    # 动态获取a, b, c 系数
+    coefficients = [
+        (3955 / 1024, -8306 / 1024, 5008 / 1024),
+        (3735 / 1024, -6681 / 1024, 3463 / 1024),
+        (3799 / 1024, -6499 / 1024, 3211 / 1024),
+        (4019 / 1024, -6385 / 1024, 2906 / 1024),
+        (2677 / 1024, -3029 / 1024, 1162 / 1024),
+        (2172 / 1024, -1833 / 1024,  682 / 1024),
+    ]
+    if t < 0:
+        raise ValueError("Time index t cannot be negative!")
+    elif t < len(coefficients):
+        raise ValueError("Time index t 超出范围！ (Time index t is out of range!)")
+    else:
+        raise ValueError("Time index t 超出范围！")
+
+@torch.compile
+def zeropower_via_newtonschulz6_dynamic(G):
+    """
+    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G using dynamic coefficients.
+    This method dynamically adjusts the coefficients (a, b, c) for each iteration to improve performance.
+    The function ensures the spectral norm of G is at most 1 and performs six iterations of the process.
+
+    Args:
+        G (torch.Tensor): A 2D tensor to be orthogonalized.
+
+    Returns:
+        torch.Tensor: The orthogonalized tensor.
+    """
+    # https://spaces.ac.cn/archives/10922
+    # 
+    assert len(G.shape) == 2
+    
+    # 
+
+    if G.size(0) > G.size(1):
+        X = X.T
+    # Ensure spectral norm is at most 1
+    X = X / (X.norm() + 1e-7)
+    # Perform the NS iterations
+    for _ in range(6):
+        a, b, c = get_dynamic_coefficients(_)
+        A = X @ X.T
+        B = (
+            b * A + c * A @ A
+        )  # adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
+        X = a * X + B @ X
+
+    if G.size(0) > G.size(1):
+        X = X.T
+    return X
+
+
+
+class Muon(torch.optim.Optimizer):
+    """
+    Muon - MomentUm Orthogonalized by Newton-schulz
+
+    Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
+    processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
+    matrix. To efficiently orthogonalize each update, we use a Newton-Schulz iteration, which has
+    the advantage that it can be stably run in bfloat16 on the GPU.
+
+    Some warnings:
+    - We believe this optimizer is unlikely to work well for training with small batch size.
+    - We believe it may not work well for finetuning pretrained models, but we haven't tested this.
+
+    Arguments:
+        muon_params: The parameters to be optimized by Muon.
+        lr: The learning rate. The updates will have spectral norm of `lr`. (0.02 is a good default)
+        momentum: The momentum used by the internal SGD. (0.95 is a good default)
+        nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
+        ns_steps: The number of Newton-Schulz iterations to run. (6 is probably always enough)
+        adamw_params: The parameters to be optimized by AdamW. Any parameters in `muon_params` which are
+        {0, 1}-D or are detected as being the embed or lm_head will be optimized by AdamW as well.
+        adamw_lr: The learning rate for the internal AdamW.
+        adamw_betas: The betas for the internal AdamW.
+        adamw_eps: The epsilon for the internal AdamW.
+        adamw_wd: The weight decay for the internal AdamW.
+    """
+
+    def __init__(
+        self,
+        lr=1e-3,
+        wd=0.1,
+        muon_params=None,
+        momentum=0.95,
+        nesterov=True,
+        ns_steps=5,
+        adamw_params=None,
+        adamw_betas=(0.9, 0.95),
+        adamw_eps=1e-8,
+    ):
+
+        defaults = dict(
+            lr=lr,
+            wd=wd,
+            momentum=momentum,
+            nesterov=nesterov,
+            ns_steps=ns_steps,
+            adamw_betas=adamw_betas,
+            adamw_eps=adamw_eps,
+        )
+
+        params = list(muon_params)
+        adamw_params = list(adamw_params) if adamw_params is not None else []
+        params.extend(adamw_params)
+        super().__init__(params, defaults)
+        # Sort parameters into those for which we will use Muon, and those for which we will not
+        for p in muon_params:
+            # Use Muon for every parameter in muon_params which is >= 2D and doesn't look like an embedding or head layer
+            assert p.ndim == 2, p.ndim
+            self.state[p]["use_muon"] = True
+        for p in adamw_params:
+            # Do not use Muon for parameters in adamw_params
+            self.state[p]["use_muon"] = False
+
+    def adjust_lr_for_muon(self, lr, param_shape):
+        A, B = param_shape[:2]
+        # We adjust the learning rate and weight decay based on the size of the parameter matrix
+        # as describted in the paper
+        adjusted_ratio = 0.2 * math.sqrt(max(A, B))
+        adjusted_lr = lr * adjusted_ratio
+        return adjusted_lr
+
+    def step(self, closure=None):
+        """Perform a single optimization step.
+
+        Args:
+            closure (Callable, optional): A closure that reevaluates the model
+                and returns the loss.
+        """
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+
+            ############################
+            #           Muon           #
+            ############################
+
+            params = [p for p in group["params"] if self.state[p]["use_muon"]]
+            # import pdb; pdb.set_trace()
+            lr = group["lr"]
+            wd = group["wd"]
+            momentum = group["momentum"]
+
+            # generate weight updates in distributed fashion
+            for p in params:
+                # sanity check
+                g = p.grad
+                if g is None:
+                    continue
+                if g.ndim > 2:
+                    g = g.view(g.size(0), -1)
+                assert g is not None
+
+                # calc update   计算动量
+                state = self.state[p]
+                if "momentum_buffer" not in state:
+                    state["momentum_buffer"] = torch.zeros_like(g)
+                buf = state["momentum_buffer"]
+                buf.mul_(momentum).add_(g)
+                if group["nesterov"]:
+                    g = g.add(buf, alpha=momentum)  # buf = momentum * buf + g
+                else:
+                    g = buf
+                u = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
+
+                # scale update
+                adjusted_lr = self.adjust_lr_for_muon(lr, p.shape)
+
+                # apply weight decay
+                p.data.mul_(1 - lr * wd)
+
+                # apply update
+                p.data.add_(u, alpha=-adjusted_lr)
+
+            ############################
+            #       AdamW backup       #
+            ############################
+
+            params = [p for p in group["params"] if not self.state[p]["use_muon"]]
+            lr = group['lr']
+            beta1, beta2 = group["adamw_betas"]
+            eps = group["adamw_eps"]
+            weight_decay = group["wd"]
+
+            for p in params:
+                g = p.grad
+                if g is None:
+                    continue
+                state = self.state[p]
+                if "step" not in state:
+                    state["step"] = 0
+                    state["moment1"] = torch.zeros_like(g)
+                    state["moment2"] = torch.zeros_like(g)
+                state["step"] += 1
+                step = state["step"]
+                buf1 = state["moment1"]
+                buf2 = state["moment2"]
+                buf1.lerp_(g, 1 - beta1)
+                buf2.lerp_(g.square(), 1 - beta2)
+
+                g = buf1 / (eps + buf2.sqrt())
+
+                bias_correction1 = 1 - beta1**step
+                bias_correction2 = 1 - beta2**step
+                scale = bias_correction1 / bias_correction2**0.5
+                p.data.mul_(1 - lr * weight_decay)
+                p.data.add_(g, alpha=-lr / scale)
+
+        return loss
+
+
+def get_model_and_dataloader(model_name, dataset_name, hidden_size):
+    name2path = {
+        "openwebtext-100k": "Elriggs/openwebtext-100k",
+    }
+    train_dataset = load_dataset(name2path[dataset_name], trust_remote_code=True)
+    if model_name == "qwen":
+        tokenizer = Qwen2Tokenizer.from_pretrained(
+            "Qwen/Qwen2.5-0.5B", trust_remote_code=True
+        )
+    else:
+        assert 0, f"model {model_name} not supported"
+    train_dataset = MoonDataset(dataset_name, train_dataset, tokenizer)
+    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
+
+    if model_name == "qwen":
+        config = Qwen2Config(
+            attention_dropout=0.0,
+            bos_token_id=151643,
+            eos_token_id=151643,
+            hidden_act="silu",
+            hidden_size=hidden_size,
+            initializer_range=0.02,
+            intermediate_size=4864,
+            max_position_embeddings=513,
+            max_window_layers=12,
+            model_type="qwen2",
+            num_attention_heads=16,
+            num_hidden_layers=12,
+            num_key_value_heads=16,
+            rms_norm_eps=1e-06,
+            rope_theta=1000000.0,
+            sliding_window=1024,
+            tie_word_embeddings=True,
+            torch_dtype="bfloat16",
+            use_cache=True,
+            use_mrope=False,
+            use_sliding_window=False,
+            vocab_size=151936,
+        )
+        model = Qwen2ForCausalLM(config)
+    else:
+        assert 0, f"model {model_name} not supported"
+    return model, train_loader
+
+
+def get_optimizer(optimizer_name, model, lr=1e-3, wd=0.1):
+    if optimizer_name == "adamw":
+        return torch.optim.AdamW(
+            model.parameters(), lr=lr, weight_decay=wd, betas=(0.9, 0.95)
+        )
+    elif optimizer_name == "muon":
+        muon_params = [
+            p
+            for name, p in model.named_parameters()
+            if p.ndim >= 2 and "embed_tokens" not in name and "lm_head" not in name
+        ]
+        adamw_params = [
+            p
+            for name, p in model.named_parameters()
+            if not (
+                p.ndim >= 2 and "embed_tokens" not in name and "lm_head" not in name
+            )
+        ]
+
+        return Muon(
+            lr=lr,
+            wd=wd,
+            muon_params=muon_params,
+            adamw_params=adamw_params,
+        )
+    else:
+        assert 0, "optimizer not supported"
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", type=str, default="qwen")
+    parser.add_argument("--optimizer", type=str, default="adamw")
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--wd", type=float, default=0.1)
+    parser.add_argument("--dataset", type=str, default="openwebtext-100k")
+    parser.add_argument("--hidden_size", type=int, default=1024)
+    args = parser.parse_args()
+
+    model, train_loader = get_model_and_dataloader(
+        args.model, args.dataset, args.hidden_size
+    )
+    optimizer = get_optimizer(
+        args.optimizer, model, lr=args.lr
+    )
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+
+    model.train()
+    epoch = 1
+    lr_scheduler = get_cosine_schedule_with_warmup(
+        optimizer=optimizer,
+        num_warmup_steps=100,
+        num_training_steps=len(train_loader) * epoch,
+        num_cycles=0.5,
+    )
+    for epoch in range(epoch):
+        for step, batch in enumerate(train_loader):
+            batch = batch.to(device)
+            input_ids = batch
+            outputs = model(input_ids=input_ids, labels=input_ids)
+            loss = outputs.loss
+            loss.backward()
+            optimizer.step()
+            lr_scheduler.step()
+            optimizer.zero_grad()
+
+
+import numpy as np
+
+def orth(G):
+    """
+    实现论文中定义的梯度正交化操作: orth(G) = (GG^T)^(-1/2)G
+    这是 Muon 优化器的核心，通过谱范数推导而来。
+    
+    参数:
+    G (np.ndarray): 一个 m x n 的梯度矩阵，其中 m <= n。
+    
+    返回:
+    np.ndarray: 一个 m x n 的正交化后的矩阵 Ok，满足 Ok @ Ok.T = I (单位矩阵)。
+    """
+    # 计算 G @ G.T
+    GG_T = G @ G.T
+    
+    # 使用奇异值分解 (SVD) 来计算 (GG^T) 的逆平方根
+    # 对于对称半正定矩阵 GG_T, SVD 分解 U @ S @ Vh 等价于特征分解 U @ D @ U.T
+    # 因此，(GG_T)^(-1/2) = U @ D^(-1/2) @ U.T
+    try:
+        # U 是特征向量矩阵，S 是奇异值（在此为特征值）的一维数组
+        U, S, _ = np.linalg.svd(GG_T)
+        
+        # 为了数值稳定性，避免除以非常小的奇异值
+        # 创建一个对角矩阵，其元素为 1/sqrt(s_i)
+        S_inv_sqrt = np.diag(1.0 / np.sqrt(S[S > 1e-9]))
+        
+        # 获取与非零奇异值对应的 U 的列
+        U_crop = U[:, :S_inv_sqrt.shape[0]]
+
+        # 计算逆平方根矩阵: (GG^T)^(-1/2) = U @ D^(-1/2) @ U^T
+        GG_T_inv_sqrt = U_crop @ S_inv_sqrt @ U_crop.T
+        
+        # 返回最终的正交化矩阵
+        return GG_T_inv_sqrt @ G
+        
+    except np.linalg.LinAlgError:
+        # 如果矩阵是奇异的或计算失败，返回一个伪逆作为备选方案
+        pseudo_inverse = np.linalg.pinv(G)
+        return pseudo_inverse.T # 返回转置以匹配维度
+
+
+def stochastic_trust_region_optimizer(grad_estimator, initial_x, eta, alpha, num_steps):
+    """
+    实现了论文中的算法1：带冲量的随机非欧几里得信赖域梯度方法。
+    为简单起见，此实现使用标准的 L2 范数（欧几里得范数）。
+    
+    参数:
+    grad_estimator (function): 一个函数，输入 x，返回目标函数在 x 处的随机梯度。
+    initial_x (np.ndarray): 优化的起始点。
+    eta (float): 信赖域半径 (学习率/步长)。
+    alpha (float): 动量更新参数 (0 < alpha <= 1)。
+    num_steps (int): 优化的总步数。
+    
+    返回:
+    np.ndarray: 经过 num_steps 步优化后的最终参数点。
+    """
+    # 1. 初始化参数
+    x = initial_x.copy()
+    
+    # 2. 根据论文建议，用第一次的梯度初始化动量 m
+    stochastic_gradient = grad_estimator(x)
+    m = stochastic_gradient
+    
+    print(f"开始优化... \n初始位置 x_0 = {x}, 初始动量 m_0 (基于首次梯度) = {np.round(m, 2)}")
+    print("-" * 50)
+
+    # 3. 开始迭代
+    for k in range(num_steps):
+        # 3.1 获取当前点的随机梯度 g(x_k; ξ_k)
+        stochastic_gradient = grad_estimator(x)
+        
+        # 3.2 更新动量: m_{k+1} = (1 - α)m_k + αg(x_k; ξ_k)
+        m = (1 - alpha) * m + alpha * stochastic_gradient
+        
+        # 3.3 信赖域更新 (L2范数下的解析解)
+        # x_{k+1} = x_k - η * (m_{k+1} / ||m_{k+1}||_2)   这里发生了正交化？
+        m_norm = np.linalg.norm(m)
+        if m_norm > 1e-8: # 避免除以零
+            x = x - eta * (m / m_norm)
+        
+        if (k + 1) % 10 == 0:
+            print(f"步骤 {k+1}/{num_steps}: x_{k+1} = {np.round(x, 2)}")
+            
+    return x
+
+# --- 测试与验证 ---
+
+# --- 测试 1: 验证 `orth` 函数的正交性 ---
+print("--- 测试 1: 验证 `orth` 函数 ---")
+# 创建一个随机的 m x n 梯度矩阵 (m < n)
+m, n = 3, 5
+G = np.random.randn(m, n)
+print(f"输入一个随机的 {m}x{n} 梯度矩阵 G。")
+
+# 应用 orth 操作
+Ok = orth(G)
+print(f"orth(G) 函数的输出 Ok 是一个 {Ok.shape} 矩阵。")
+
+# 验证核心性质: Ok @ Ok.T 是否为单位矩阵
+Ok_Ok_T = Ok @ Ok.T
+identity_matrix = np.eye(m)
+
+print("\n验证 Ok @ Ok.T 是否为单位矩阵 I:")
+print("Ok @ Ok.T =\n", np.round(Ok_Ok_T, 10)) # 四舍五入到10位小数以便查看
+print("单位矩阵 I =\n", identity_matrix)
+
+# 使用 np.allclose 进行数值稳定的比较
+is_orthogonal = np.allclose(Ok_Ok_T, identity_matrix)
+print(f"\n结果验证: Ok @ Ok.T 与单位矩阵是否相等? -> {is_orthogonal}")
+assert is_orthogonal, "orth 函数验证失败！"
+print("`orth` 函数验证成功！\n\n")
+
+
+# --- 测试 2: 在一个简单二次函数上运行优化器 ---
+print("--- 测试 2: 运行优化器 ---")
+
+# 定义一个简单的二次目标函数 f(x) = 0.5 * ||x||^2
+# 其真实梯度为 ∇f(x) = x。最小值为 f(0,0) = 0。
+def objective_function(x):
+    return 0.5 * np.sum(x**2)
+
+# 定义一个梯度估计器，它返回真实梯度并加上一些高斯噪声
+def gradient_estimator(x):
+    true_gradient = x
+    noise = np.random.randn(*x.shape) * 0.5 # 添加噪声
+    return true_gradient + noise
+
+# 设置优化参数
+initial_x = np.array([10.0, -8.0])
+eta = 0.5         # 学习率/步长
+alpha = 0.1       # 动量参数 (较大的动量平滑)
+num_steps = 50    # 优化步数
+
+# 运行优化器
+final_x = stochastic_trust_region_optimizer(
+    grad_estimator=gradient_estimator,
+    initial_x=initial_x,
+    eta=eta,
+    alpha=alpha,
+    num_steps=num_steps
+)
+
+print("-" * 50)
+print("优化完成。")
+print(f"初始点: {initial_x}")
+print(f"最优解应为: [0. 0.]")
+print(f"优化后得到的最终点: {np.round(final_x, 4)}")
+
+initial_dist = np.linalg.norm(initial_x)
+final_dist = np.linalg.norm(final_x)
+print(f"\n到最优解的距离: 从 {initial_dist:.2f} 减小到 {final_dist:.2f}。")
+assert final_dist < initial_dist, "优化器未能靠近最优解！"
+print("优化器功能验证成功！")
