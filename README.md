@@ -7,7 +7,7 @@ Authors: ChengCao Yang\*
 Recent outcome-based reinforcement learning methods have improved the training of large language models (LLMs) for reasoning tasks, but many policy optimization schemes remain reliant on sparse terminal rewards and are prone to entropy collapse, which reduces output diversity. We introduce **GIPO (Group Information Policy Optimizer)**, a novel reinforcement learning framework built upon the **Information Bottleneck**, to address these limitations. This approach promotes principled, diverse exploration while encouraging the model to learn compact and informative internal representations.
 
 This capability relies on two key innovations:
-1.  **A group-sequential entropy regularizer** that introduces a progressive entropy constraint applied to intermediate reasoning steps. This prevents premature entropy collapse while allowing sufficient diversity early in the generation process.
+1.  **A group-sequential entropy regularizer** that introduces a progressive entropy constraint applied to intermediate reasoning steps. This prevents premature entropy cleacollapse while allowing sufficient diversity early in the generation process.
 2.  **A confidence-guided implicit reward** derived from information-bottleneck principles. This reward encourages the model to produce compressed, informative internal states that are predictive of eventual successful outcomes, moving beyond a sole reliance on sparse terminal rewards.
 
 Empirical results across multiple reasoning benchmarks demonstrate that GIPO improves reasoning quality, sample efficiency, and generation diversity compared to strong outcome-based RL baselines, especially under constrained token budgets.
