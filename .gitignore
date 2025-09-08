@@ -134,3 +134,4 @@ my_job_output*
 .github/workflows/secrets_scan.yml
 myjob_*
 recipe/gspo_ib/*.sh
+kimi2_claude_code.out
