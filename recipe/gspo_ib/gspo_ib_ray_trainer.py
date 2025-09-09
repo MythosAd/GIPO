@@ -67,8 +67,8 @@ class RayGSPOIBTrainer(RayPPOTrainer):
         self.global_steps = 0
         self.gen_steps = 0
         # 尝试从检查点加载模型，恢复训练
-        breakpoint()  
-        self._load_checkpoint()
+        # breakpoint()  
+        self._load_checkpoint() 
         # 在训练前先做一次验证（如果配置允许）
         if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
             val_metrics = self._validate() # 调用验证函数
