@@ -12,50 +12,61 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import uuid  # 用于生成唯一的ID
-from collections import defaultdict  # 用于创建默认值为特定类型的字典
-from copy import deepcopy  # 用于创建对象的深拷贝
-from pprint import pprint  # 用于美观地打印复杂的数据结构
+import uuid
+from collections import defaultdict
+from copy import deepcopy
+from pprint import pprint
 
-import numpy as np  # 导入 NumPy 库
-import torch  # 导入 PyTorch 库
-from tqdm import tqdm  # 导入 tqdm 库，用于显示进度条
+import numpy as np
+import torch
+from tqdm import tqdm
 
-from verl import DataProto  # 导入自定义的数据协议类
-from verl.trainer.ppo.core_algos import agg_loss  # 从核心算法模块导入损失聚合函数
-from verl.trainer.ppo.metric_utils import ( # 从指标工具模块导入一系列计算函数
+from verl import DataProto
+from verl.trainer.ppo.core_algos import agg_loss
+from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
-    reduce_metrics,
+   reduce_metrics,
 )
-from verl.trainer.ppo.ray_trainer import (  # 从 Ray 训练器基类模块导入相关组件
+from verl.trainer.ppo.ray_trainer import (
     AdvantageEstimator,
     RayPPOTrainer,
     apply_kl_penalty,
     compute_advantage,
     compute_response_mask,
 )
-from verl.utils.profiler import marked_timer  # 导入一个计时器上下文管理器
-from verl.utils.model import compute_position_id_with_mask  # 导入计算 position_id 的工具函数
-
+from verl.utils.profiler import marked_timer
+from verl.utils.metric import reduce_metrics
 
 class RayGSPOIBTrainer(RayPPOTrainer):
     """
-    GSPO-IB (Goal-driven Self-improving Policy Optimization with In-context Bootstrapping) 的 Ray 训练器。
-    这个训练器实现了 GSPO-IB 算法，该算法旨在通过一种复合奖励机制来提升需要复杂推理的任务（如数学问题）的性能。
     """
+    def _create_rollout_gt_batch(self, batch: DataProto) -> DataProto:  
+        # 从batch中提取rollout生成的响应和ground truth  
+        responses = batch.batch["responses"]  # rollout生成的响应  
+        ground_truths = batch.non_tensor_batch.get("ground_truth", [])  # 正确答案  
+
+        # 拼接响应和正确答案，创建新的输入序列  
+        # 具体实现取决于你的拼接策略  
+        enhanced_sequences = self._concatenate_response_and_gt(responses, ground_truths)  
+
+        # 创建新的DataProto用于重新推理  
+        enhanced_batch = DataProto.from_dict({  
+            "input_ids": enhanced_sequences,  
+            "attention_mask": self._create_attention_mask(enhanced_sequences)  
+        })
+
+        return enhanced_batch
+
 
     def fit(self):
         """
-        GSPO-IB 算法的核心训练循环。
-        这个循环负责协调数据生成、复合奖励计算、优势估计和模型更新等步骤。
         """
-        from omegaconf import OmegaConf  # 导入 OmegaConf 库，用于处理复杂的配置
+        from omegaconf import OmegaConf
 
-        from verl.utils.tracking import Tracking  # 导入追踪/日志工具
+        from verl.utils.tracking import Tracking
 
-        # 初始化日志记录器
         logger = Tracking(
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
@@ -63,294 +74,362 @@ class RayGSPOIBTrainer(RayPPOTrainer):
             config=OmegaConf.to_container(self.config, resolve=True),
         )
 
-        # 初始化全局步数和生成步数
         self.global_steps = 0
         self.gen_steps = 0
-        # 尝试从检查点加载模型，恢复训练
-        # breakpoint()  
-        self._load_checkpoint() 
-        # 在训练前先做一次验证（如果配置允许）
+        
+        self._load_checkpoint()
+
         if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
-            val_metrics = self._validate() # 调用验证函数
-            assert val_metrics, f"{val_metrics=}" # 确保验证有返回结果
-            pprint(f"Initial validation metrics: {val_metrics}") # 打印初始验证指标
-            logger.log(data=val_metrics, step=self.global_steps) # 记录初始验证指标
-            # 如果配置为"只验证不训练"，则在此处直接返回
+            val_metrics = self._validate()
+            assert val_metrics, f"{val_metrics=}"
+            pprint(f"Initial validation metrics: {val_metrics}")
+            logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
                 return
 
-        # 创建训练进度条
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
-        
-        # 我们从第 1 步开始训练
+     
         self.global_steps += 1
         self.gen_steps += 1
-        last_val_metrics = None # 用于存储最后一次的验证指标
+        last_val_metrics = None
 
-        # --- 性能分析 (Profiling) 相关的标志位 ---
-        # 上一步是否进行了性能分析
         prev_step_profile = False
-        # 当前步是否需要进行性能分析 (根据配置文件中的 `profile_steps` 列表)
-        curr_step_profile = True
-        # 下一步是否需要进行性能分析
+        curr_step_profile = (
+            self.global_steps in self.config.global_profiler.steps
+            if self.config.global_profiler.steps is not None
+            else False
+        )
         next_step_profile = False
 
-        # 初始化一个字典来记录各个阶段的耗时
         timing_raw = defaultdict(float)
-        # 初始化 `batch` 为 None，用于后续累积数据
-        batch = None
-        # 当前累积的 batch 中包含的 prompt 数量
+        # ### 变量名优化 ###: `batch` -> `training_batch`，明确其作为最终训练批次的角色。
+        training_batch = None
         num_prompt_in_batch = 0
-        # 当前为一个训练步已经生成了多少个批次的数据（在启用过滤时使用）
         num_gen_batches = 0
-        
-        # 外层循环：遍历所有 epoch
+
         for epoch in range(self.config.trainer.total_epochs):
-            # 内层循环：遍历训练数据加载器中的每个批次
             for batch_dict in self.train_dataloader:
-                metrics = {} # 初始化一个空字典，用于收集当前步骤的所有指标
-                # 将从 dataloader 中获取的字典转换为自定义的 DataProto 对象
-                new_batch: DataProto = DataProto.from_single_dict(batch_dict)
+                metrics = {}
+                with marked_timer("start_profile", timing_raw):
+                    self._start_profiling(
+                        not prev_step_profile and curr_step_profile
+                        if self.config.global_profiler.profile_continuous_steps
+                        else curr_step_profile
+                    )
+                
+                rollout_data: DataProto = DataProto.from_single_dict(batch_dict)
                 num_gen_batches += 1
-                # 弹出（pop）生成（generation）阶段需要的键
-                if "multi_modal_data" in new_batch.non_tensor_batch.keys():
-                    # 如果是多模态数据，需要额外 pop 出 'multi_modal_data'
-                    gen_batch = new_batch.pop(
+                
+                if "multi_modal_data" in rollout_data.non_tensor_batch.keys():
+                    gen_batch = rollout_data.pop(
                         batch_keys=["input_ids", "attention_mask", "position_ids"],
                         non_tensor_batch_keys=["raw_prompt_ids", "multi_modal_data"],
                     )
                 else:
-                    # 对于纯文本数据，只 pop 出文本相关的键
-                    gen_batch = new_batch.pop(
+                    gen_batch = rollout_data.pop(
                         batch_keys=["input_ids", "attention_mask", "position_ids"],
                         non_tensor_batch_keys=["raw_prompt_ids"],
                     )
                 
-                # 为了增加探索，对每个 prompt 生成 n 个不同的响应（rollout）
-                # 这里通过 `repeat` 方法将 gen_batch 复制 n 份
                 gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
 
-                # 判断当前是否为整个训练过程的最后一步
                 is_last_step = self.gen_steps >= self.total_training_steps
 
-            
-
-                # 使用计时器记录整个 PPO 单步（step）的耗时
                 with marked_timer("step", timing_raw):
+
                     # === 1. 生成 (Rollout) 阶段 ===
-                    # 使用计时器记录生成响应的耗时
                     with marked_timer("gen", timing_raw, "red"):
-                        # 调用 actor worker group 的远程方法来生成序列
                         gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
-                    # 为每条数据生成一个唯一ID，用于后续在乱序后也能正确匹配数据
-                    new_batch.non_tensor_batch["uid"] = np.array(
-                        [str(uuid.uuid4()) for _ in range(len(new_batch.batch))], dtype=object
+
+                    rollout_data.non_tensor_batch["uid"] = np.array(
+                        [str(uuid.uuid4()) for _ in range(len(rollout_data.batch))], dtype=object
                     )
-                    # 将 prompt 数据也复制 n 份，与生成的响应对齐
-                    batch = new_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                    # 将生成结果（如序列）合并到主批次中
-                    batch = batch.union(gen_batch_output)
-                    # 计算响应部分的 mask，用于后续计算中忽略 prompt 部分
-                    if "response_mask" not in batch.batch.keys():# batch.batch["attention_mask"].shape
-                        batch.batch["response_mask"] = compute_response_mask(batch)
-                    
-                    # （可选）平衡不同 GPU 卡上的 token 数量，以优化数据并行（DP）的负载均衡
-                    if self.config.trainer.balance_batch:
-                        self._balance_batch(batch, metrics=metrics)
+                    rollout_data = rollout_data.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    rollout_data = rollout_data.union(gen_batch_output)
 
-                    # 计算全局有效 token 数量
-                    batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
-
-                    # 4. 【计算旧策略的 Log Probs】
+                    # === 2. 计算 Log Probs ===
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
-                        # 计算生成响应时所用的策略（即更新前的 Actor）的对数概率
-                        old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                        # 提取每个 token 的对数概率和熵   # shape: (batch_size, response_len)
+                        old_log_prob = self.actor_rollout_wg.compute_log_prob(rollout_data)
                         entropys = old_log_prob.batch["entropys"]
-                        response_masks = batch.batch["response_mask"]
+                        response_masks = compute_response_mask(rollout_data)
                         loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
                         entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
-                        old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
-                        metrics.update(old_log_prob_metrics)
+                        metrics.update({"actor/entropy": entropy_agg.detach().item()})
                         old_log_prob.batch.pop("entropys")
-                        batch = batch.union(old_log_prob)
-                        
-              
-                    # === 2. GSPO-IB 复合奖励 (Composite Reward) 计算阶段 ===
+                        rollout_data = rollout_data.union(old_log_prob)
+
+
+
                     with marked_timer("composite_reward", timing_raw, "yellow"):
+                        # 1. external reward
                         try:
-                            reward_result = self.reward_fn(batch, return_dict=True)
-                            # scalar_rewards 是外部奖励，已经是序列级的
-                            # 形状为 [B, L]，但在 response 最后一个 token 才有值
-                            scalar_rewards = reward_result["reward_tensor"]
+                            reward_result = self.reward_fn(rollout_data, return_dict=True)
+                          
+                            external_rewards = reward_result["reward_tensor"]
                             reward_extra_infos_dict = reward_result.get("reward_extra_info", {})
                         except Exception as e:
                             print(f"Error in reward_fn: {e}")
-                            scalar_rewards = self.reward_fn(batch)
+                            external_rewards = self.reward_fn(rollout_data)
                             reward_extra_infos_dict = {}
 
                         reasoning_token_lens = reward_extra_infos_dict.get("reasoning_token_len")
                         answer_token_lens = reward_extra_infos_dict.get("answer_token_len")
-
-
-                        # 初始化最终奖励，默认等于外部奖励
-                        final_rewards = scalar_rewards
-
-                         # === 3. 优势 (Advantage) & 价值 (Value) 计算 ===
-                        norm_adv_by_std_in_grpo=True
-                        scores = final_rewards.sum(dim=-1)
-                        epsilon: float = 1e-6
-                        id2score = defaultdict(list)
-                        id2mean = {}
-                        id2std = {}
-                        index = batch.non_tensor_batch["uid"]
-                        response_mask = batch.batch["response_mask"]
-                        with torch.no_grad():
-                            bsz = scores.shape[0]
-                            for i in range(bsz):
-                                id2score[index[i]].append(scores[i])
-                            for idx in id2score:
-                                if len(id2score[idx]) == 1:
-                                    id2mean[idx] = torch.tensor(0.0)
-                                    id2std[idx] = torch.tensor(1.0)
-                                elif len(id2score[idx]) > 1:
-                                    scores_tensor = torch.stack(id2score[idx])
-                                    id2mean[idx] = torch.mean(scores_tensor)
-                                    id2std[idx] = torch.std(scores_tensor)
-                                else:
-                                    raise ValueError(f"no score in prompt index: {idx}")
-                            for i in range(bsz):
-                                if norm_adv_by_std_in_grpo:
-                                    scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
-                                else:
-                                    scores[i] = scores[i] - id2mean[index[i]]
-                            scores = scores.unsqueeze(-1) * response_mask
-
-    
                         
-                        if reasoning_token_lens and answer_token_lens:
-                            batch_size = entropys.shape[0]
+                        composite_rewards = external_rewards
 
-                            reasoning_mask = torch.zeros_like(entropys, dtype=torch.bool)
-                            answer_mask = torch.zeros_like(entropys, dtype=torch.bool)
 
-                            for i in range(batch_size):
-                                len_r = reasoning_token_lens[i]
-                                len_a = answer_token_lens[i]
+                        # 2. reasoning_entropy reward
+                        batch_size = entropys.shape[0]
+                        seq_len = entropys.shape[1]
 
-                                # 找出响应的起始位置 (第一个为 True 的地方)
-                                response_start_indices = torch.where(response_masks[i])[0]
-                                if len(response_start_indices) == 0:
-                                    continue # 该序列没有响应
-                                start_index = response_start_indices[0]
+                        start_indices = torch.argmax(response_masks.long(), dim=-1)
 
-                                # 从响应的起始位置开始创建 mask
-                                reasoning_mask[i, start_index : start_index + len_r] = True
-                                answer_mask[i, start_index + len_r : start_index + len_r + len_a] = True
+                        # 3. 计算推理和答案部分的结束索引
+                        reasoning_end_indices = start_indices + torch.tensor(reasoning_token_lens, device=start_indices.device, dtype=start_indices.dtype)
 
-                            final_reasoning_mask = reasoning_mask & response_masks.bool()
-                            final_answer_mask = answer_mask & response_masks.bool()
+                        answer_end_indices = reasoning_end_indices + torch.tensor(answer_token_lens, device=reasoning_end_indices.device, dtype=reasoning_end_indices.dtype)
+                        seq_indices = torch.arange(seq_len, device=entropys.device, dtype=torch.int64).unsqueeze(0)
+                        reasoning_mask = (seq_indices >= start_indices.unsqueeze(1)) & (seq_indices < reasoning_end_indices.unsqueeze(1))
+                        answer_mask = (seq_indices >= reasoning_end_indices.unsqueeze(1)) & (seq_indices < answer_end_indices.unsqueeze(1))
+                        
+                        decay_rate = self.config.algorithm.get("entropy_decay_rate",1.0)
+                        seq_len = entropys.shape[1]
+                        
+                        reasoning_start_indices = torch.argmax(reasoning_mask.long(), dim=-1, keepdim=True)
+                        relative_indices = torch.clamp(seq_indices - reasoning_start_indices, min=0)
+                        position_weights = torch.pow(decay_rate, relative_indices)
+                        
+                        reasoning_reward =   (entropys * position_weights) * reasoning_mask
 
-                            # ### 核心修正：计算并应用分布式的内在奖励 ###
-
-                            # --- 1. 思维多样性奖励 (Token-level, 修正后) ---
-                            # 目标: 鼓励模型在推理阶段探索更多样化的思考路径，并按 token 分布奖励。
-                            # 方法: 将每个 reasoning token 的熵作为奖励，并施加一个从 reasoning 部分开始随位置递减的权重。
-                            gamma = self.config.algorithm.get("gamma_entropy", 0.01)
-                            decay_rate = self.config.algorithm.get("entropy_decay_rate", 0.999) # 1.0 表示不衰减
-                            batch_size, seq_len = entropys.shape
-
-                            # --- 创建相对于 reasoning 起始位置的衰减权重 ---
-                            seq_indices = torch.arange(seq_len, device=entropys.device, dtype=torch.float32).unsqueeze(0)
-                            reasoning_start_indices = torch.argmax(final_reasoning_mask.long(), dim=-1, keepdim=True)
-                            relative_indices = seq_indices - reasoning_start_indices
-                            relative_indices[relative_indices < 0] = 0
-                            position_weights = torch.pow(decay_rate, relative_indices)
-
-                            weighted_entropies = entropys * position_weights
-                            reasoning_reward = gamma * weighted_entropies * final_reasoning_mask
-
-                            # --- 2. 推理质量奖励 (Token-level) ---
-                            # 目标: 鼓励模型在给出推理后，生成高质量、高置信度的答案。
-                            # 方法: 将每个 answer token 的对数概率作为奖励。
-                            eta = self.config.algorithm.get("eta_logprob", 0.1)
-                            log_probs = batch.batch["old_log_probs"]
-                            answer_reward = eta * log_probs * final_answer_mask
-
-                            # --- 3. 合并与应用奖励 ---
-                            token_level_intrinsic_reward = (reasoning_reward + answer_reward).detach()
-                            final_rewards =scores + token_level_intrinsic_reward
+                        eta = self.config.algorithm.get("eta", 0.1)
+ 
+                        # 在现有的奖励计算之后添加  
+                        # 3. answer_log_prob reward
+                        with marked_timer("rollout_with_gt_inference", timing_raw, color="purple"):  
+                            # 拼接rollout结果和正确答案  
+                            # enhanced_batch = self._create_rollout_gt_batch(batch)  
                             
-                            # --- 4. 指标记录 ---
-                            reasoning_total_entropy = (entropys * final_reasoning_mask).sum(dim=-1)
-                            answer_total_log_prob = (log_probs * final_answer_mask).sum(dim=-1) # 使用 log_probs
-                            composite_ib_reward = token_level_intrinsic_reward.sum(dim=-1)
+                            responses = rollout_data.batch["responses"]  # rollout生成的响应   8 x 512   151643 padding
+                            
+                            # 收集 ground-truth 文本（最小化临时对象）
+                            ground_truth_ids_list_of_tensors = [torch.tensor(rollout_data[i].non_tensor_batch["reward_model"]["ground_truth_ids"], dtype=torch.int64) for i in range(len(responses))]
+                            
+                            
+                            # 2. 使用 pad_sequence 进行填充和堆叠
+                            # batch_first=True 使输出的维度为 (batch_size, max_length)
+                            # padding_value=0 指定用 0 进行填充,其实是有tokenizer的。 init有。
+                            # ground_truth_tensor = torch.nn.utils.rnn.pad_sequence(ground_truth_ids_list_of_tensors, batch_first=True, padding_value=0)
+                            # 拼接响应和正确答案，创建新的输入序列
+                            # 具体实现取决于你的拼接策略
+                            
+                            reasoning_len = reasoning_mask.sum(-1)
+                            new_sequences_list=[]
+                            
+                            for i in range(responses.shape[0]):
+                                response_i = responses[i]
+                                
+                                ground_truth_i = ground_truth_ids_list_of_tensors[i]
+                               
+                                # 2. 获取截断后的 response token
+                                truncated_response = response_i[:reasoning_len[i]]
+                                
+                                # 3. 拼接成最终想要的序列
+                                new_sequence = torch.cat([truncated_response, ground_truth_i])
+                                new_sequences_list.append(new_sequence)
 
-                            last_token_indices = response_masks.sum(dim=-1).long() - 1
-                            metrics.update({"reward/scalar_rewards": scalar_rewards[torch.arange(batch_size), last_token_indices].mean().item()})
+                            # 7. 对新的、长度不一的序列列表进行填充
+                            pad_token_id = self.tokenizer.pad_token_id
+                            enhanced_sequences = torch.nn.utils.rnn.pad_sequence(
+                                new_sequences_list, 
+                                batch_first=True, 
+                                padding_value=pad_token_id
+                            )
+
+                            # 8. 基于最终的序列，创建非常简单的 attention mask
+                            reasoning_answer_attention_mask = (enhanced_sequences != pad_token_id).long()
+                            position_ids = torch.arange(enhanced_sequences.size(1)).unsqueeze(0).expand(enhanced_sequences.size(0), -1)
+
+                            # 创建新的DataProto用于重新推理
+                            enhanced_batch = DataProto.from_dict({  
+                                "input_ids": enhanced_sequences,   
+                                "attention_mask": reasoning_answer_attention_mask,  
+                                "responses": enhanced_sequences, 
+                                "position_ids": position_ids
+                            })
+                            # 重新推理计算log概率作为内部奖励  
+                            reasoning_answer_log_probs = self.actor_rollout_wg.compute_log_prob(enhanced_batch) 
+
+                            #  建立 reasoning_attention_mask
+                            ground_answer_mask = torch.zeros(
+                                enhanced_sequences.shape[0], 
+                                enhanced_sequences.shape[1] - 1, 
+                                device=enhanced_sequences.device
+                            )
+
+                            for i in range(ground_answer_mask.shape[0]):
+                                ground_truth_i =ground_truth_ids_list_of_tensors[i]
+                                reasoning_len
+                                ground_truth_i_len =ground_truth_i.shape[0]
+                                ground_answer_mask[i,  reasoning_len[i]-1 : reasoning_len[i]-1 + ground_truth_i_len] = 1
+                            
+                            answer_reward = eta * reasoning_answer_log_probs.batch['old_log_probs'] * ground_answer_mask
+                            
+                            # 4. 计算复合奖励 仔细想想怎么计算合适  先使用标量实验.
+                            reasoning_r= reasoning_reward.sum(-1)
+                            answer_r =answer_reward.sum(-1)
+                            id2reasoning_score = defaultdict(list)
+                            id2answer_score = defaultdict(list)
+                            id2reasoning_mean = {}
+                            id2reasoning_std = {}
+                            id2answer_mean = {}
+                            id2answer_std = {}
+                            normalized_reasoning_scores = []
+                            normalized_answer_scores = []
+                            index = rollout_data.non_tensor_batch["uid"]
+                            with torch.no_grad():
+                                bsz = reasoning_r.shape[0]
+                                for i in range(bsz):
+                                    id2reasoning_score[index[i]].append(reasoning_r[i])
+                                    id2answer_score[index[i]].append(answer_r[i])
+                                for idx in id2reasoning_score:
+                                    if len(id2reasoning_score[idx]) == 1:
+                                        id2reasoning_mean[idx] = torch.tensor(0.0)
+                                        id2reasoning_std[idx] = torch.tensor(1.0)
+
+                                        id2answer_mean[idx] = torch.tensor(0.0)
+                                        id2answer_std[idx] = torch.tensor(1.0)
+                                    elif len(id2reasoning_score[idx]) > 1:
+                                        reasoningscores_tensor = torch.stack(id2reasoning_score[idx])
+
+                                        id2reasoning_mean[idx] = torch.mean(reasoningscores_tensor)
+                                        id2reasoning_std[idx] = torch.std(reasoningscores_tensor)
+
+                                        answerscores_tensor = torch.stack(id2answer_score[idx])
+
+                                        id2answer_mean[idx] = torch.mean(answerscores_tensor)
+                                        id2answer_std[idx] = torch.std(answerscores_tensor)
+                                    else:
+                                        raise ValueError(f"no score in prompt index: {idx}")
+                                for i in range(bsz):
+                                    # if norm_adv_by_std_in_grpo:
+                                        normalized_reasoning_score = (reasoning_r[i] - id2reasoning_mean[index[i]]) / (id2reasoning_std[index[i]] + 1e-6)
+                                        normalized_answer_score = (answer_r[i] - id2answer_mean[index[i]]) / (id2answer_std[index[i]] + 1e-6)
+                                        normalized_reasoning_scores.append(normalized_reasoning_score)
+                                        normalized_answer_scores.append(normalized_answer_score)
+                                    # else:
+                                    #     scores[i] = scores[i] - id2mean[index[i]]
+
+                            reasoning_r_regular = torch.stack(normalized_reasoning_scores)
+                            answer_r_regular = torch.stack(normalized_answer_scores)
+
+
+
+                            gamma = self.config.algorithm.get("gamma", 0.01)
+                            eta = self.config.algorithm.get("eta", 0.01)
+                            breakpoint()
+                            intrinsic_reward = reasoning_r_regular*gamma + answer_r_regular*eta # batch_size x response_len
+                            
+                            # 创建与external_rewards相同形状的零张量  
+                            
+                            # 找到每个序列的最后一个有效token位置  
+                            last_token_indices =  (responses != pad_token_id).long().sum(-1)-1 # batch_size  
+
+                            intrinsic_reward_expanded = torch.zeros_like(external_rewards)  # batch_size x seq_len  
+                            # 将intrinsic_reward分配到最后一个有效token位置  
+                            batch_indices = torch.arange(intrinsic_reward.size(0))  
+                            intrinsic_reward_expanded[batch_indices, last_token_indices] = intrinsic_reward.squeeze(-1)  
+                            
+                            composite_rewards = external_rewards + intrinsic_reward_expanded
+                            
                             metrics.update({
-                                "reward/reasoning_total_entropy": reasoning_total_entropy.mean().item(),
-                                "reward/answer_total_log_prob": answer_total_log_prob.mean().item(),
-                                "reward/composite_ib_reward": composite_ib_reward.mean().item(),
-                                "reward/token_level_intrinsic_reward": token_level_intrinsic_reward.mean().item(),
+                                "reward/reasoning_r": reasoning_r.mean().item(),
+                                "reward/answer_r": answer_r.mean().item(),
                             })
 
-                        # 将最终的、正确的、序列级的复合奖励赋值给 `batch`
-                        batch.batch["token_level_rewards"] = final_rewards # t
-                        batch.batch['token_level_scores'] = final_rewards
+                        rollout_data.batch["token_level_scores"] = composite_rewards
+                        rollout_data.batch["token_level_rewards"] = composite_rewards
 
-                    # === 3. 优势 (Advantage) & 价值 (Value) 计算 ===
-                    # with marked_timer("adv", timing_raw, "brown"):
-                    #     # 现在，`compute_grpo_outcome_advantage` 会收到一个正确的、序列级的奖励张量
-                    #     # `scalar_rewards` 仍然是稀疏的，但其在最后一个 token 上的值现在包含了我们所有的奖励信号
-                    #     norm_adv_by_std_in_grpo=True
-                    #     scores = batch.batch["token_level_rewards"].sum(dim=-1)
-                    #     epsilon: float = 1e-6
-                    #     id2score = defaultdict(list)
-                    #     id2mean = {}
-                    #     id2std = {}
-                    #     index = batch.non_tensor_batch["uid"]
-                    #     response_mask = batch.batch["response_mask"]
-                    #     with torch.no_grad():
-                    #         bsz = scores.shape[0]
-                    #         for i in range(bsz):
-                    #             id2score[index[i]].append(scores[i])
-                    #         for idx in id2score:
-                    #             if len(id2score[idx]) == 1:
-                    #                 id2mean[idx] = torch.tensor(0.0)
-                    #                 id2std[idx] = torch.tensor(1.0)
-                    #             elif len(id2score[idx]) > 1:
-                    #                 scores_tensor = torch.stack(id2score[idx])
-                    #                 id2mean[idx] = torch.mean(scores_tensor)
-                    #                 id2std[idx] = torch.std(scores_tensor)
-                    #             else:
-                    #                 raise ValueError(f"no score in prompt index: {idx}")
-                    #         for i in range(bsz):
-                    #             if norm_adv_by_std_in_grpo:
-                    #                 scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
-                    #             else:
-                    #                 scores[i] = scores[i] - id2mean[index[i]]
-                    #         scores = scores.unsqueeze(-1) * response_mask
-                        batch.batch["advantages"] = final_rewards
-                        batch.batch["returns"] = final_rewards
-    
-                    # === 4. 模型更新 ===
-                    # 更新 Critic 模型
+                    # === 3. 样本过滤与批次累积 ===
+                    if not self.config.algorithm.filter_groups.enable:
+                        training_batch = rollout_data
+                    else:
+                        metric_name = self.config.algorithm.filter_groups.metric
+                        if metric_name == "seq_reward":
+                             rollout_data.non_tensor_batch["seq_reward"] = (
+                                rollout_data.batch["token_level_scores"].sum(dim=-1).numpy()
+                            )
+
+                        prompt_uid2metric_vals = defaultdict(list)
+                        for uid, metric_val in zip(
+                            rollout_data.non_tensor_batch["uid"], rollout_data.non_tensor_batch[metric_name], strict=True
+                        ):
+                            prompt_uid2metric_vals[uid].append(metric_val)
+
+                        prompt_uid2metric_std = {uid: np.std(vals) for uid, vals in prompt_uid2metric_vals.items()}
+                        kept_prompt_uids = [uid for uid, std in prompt_uid2metric_std.items() if std > 0 or len(prompt_uid2metric_vals[uid]) == 1]
+                        num_prompt_in_batch += len(kept_prompt_uids)
+
+                        kept_traj_idxs = [idx for idx, uid in enumerate(rollout_data.non_tensor_batch["uid"]) if uid in kept_prompt_uids]
+                        
+                        filtered_rollout_data = rollout_data[kept_traj_idxs]
+                        training_batch = filtered_rollout_data if training_batch is None else DataProto.concat([training_batch, filtered_rollout_data])
+
+                        prompt_bsz = self.config.data.train_batch_size
+                        if num_prompt_in_batch < prompt_bsz:
+                            max_num_gen_batches = self.config.algorithm.filter_groups.max_num_gen_batches
+                            if max_num_gen_batches <= 0 or num_gen_batches < max_num_gen_batches:
+                                progress_bar.update(1)
+                                self.gen_steps += 1
+                                continue
+                            else:
+                                raise ValueError(f"Generated too many batches ({num_gen_batches}) without filling a training batch. Check data quality or increase max_num_gen_batches.")
+                        else:
+                            traj_bsz = self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n
+                            training_batch = training_batch[:traj_bsz]
+
+                    # === 4. PPO 更新阶段 ===
+                    training_batch.batch["response_mask"] = compute_response_mask(training_batch)
+
+                    if self.config.trainer.balance_batch:
+                        self._balance_batch(training_batch, metrics=metrics)
+
+                    training_batch.meta_info["global_token_num"] = torch.sum(training_batch.batch["attention_mask"], dim=-1).tolist()
+                    
+                    if self.use_reference_policy:
+                        with marked_timer("ref", timing_raw, "olive"):
+                            ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(training_batch)
+                            training_batch = training_batch.union(ref_log_prob)
+        
+                    if self.use_critic:
+                        with marked_timer("values", timing_raw, "cyan"):
+                            values = self.critic_wg.compute_values(training_batch)
+                            training_batch = training_batch.union(values)
+
+                    with marked_timer("adv", timing_raw, "brown"):
+                        norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)
+                        training_batch = compute_advantage(
+                            training_batch,
+                            adv_estimator=self.config.algorithm.adv_estimator,
+                            gamma=self.config.algorithm.gamma,
+                            lam=self.config.algorithm.lam,
+                            num_repeat=self.config.actor_rollout_ref.rollout.n,
+                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                        )
+
+                    # === 5. 模型更新 ===
                     if self.use_critic:
                         with marked_timer("update_critic", timing_raw, "pink"):
-                            critic_output = self.critic_wg.update_critic(batch)
-                            metrics.update(reduce_metrics(critic_output.meta_info["metrics"]))
+                            critic_output = self.critic_wg.update_critic(training_batch)
+                        metrics.update(reduce_metrics(critic_output.meta_info["metrics"]))
 
-                    # 在 Critic 预热结束后，开始更新 Actor 模型
                     if self.config.trainer.critic_warmup <= self.global_steps:
-                        # update actor
                         with marked_timer("update_actor", timing_raw, "red"):
-                            actor_output = self.actor_rollout_wg.update_actor(batch)
-                            metrics.update(reduce_metrics(actor_output.meta_info["metrics"]))
+                            actor_output = self.actor_rollout_wg.update_actor(training_batch)
+                        metrics.update(reduce_metrics(actor_output.meta_info["metrics"]))
 
-                    # validate
+                    # === 6. 验证与保存 ===
                     if (
                         self.val_reward_fn is not None
                         and self.config.trainer.test_freq > 0
@@ -362,29 +441,45 @@ class RayGSPOIBTrainer(RayPPOTrainer):
                                 last_val_metrics = val_metrics
                         metrics.update(val_metrics)
 
-
-
-                # === 5. 日志记录与检查点 ===
-                # 收集与数据、时间、吞吐量相关的指标
-                metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
-                metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
-                n_gpus = self.resource_pool_manager.get_n_gpus()
-                metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
-                # 记录所有指标
-                logger.log(data=metrics, step=self.global_steps)
-                if self.config.trainer.save_freq > 0 and (
-                        is_last_step
-                        or self.global_steps % self.config.trainer.save_freq == 0
+                    if self.config.trainer.save_freq > 0 and (
+                        is_last_step or self.global_steps % self.config.trainer.save_freq == 0
                     ):
-
-                        with marked_timer("save_checkpoint", timing_raw, color="green"):
+                        with marked_timer("save_checkpoint", timing_raw, "green"):
                             self._save_checkpoint()
-                # 判断是否已完成所有训练步骤
-                if self.global_steps >= self.total_training_steps:
-                    progress_bar.close() # 关闭进度条
+
+                with marked_timer("stop_profile", timing_raw):
+                    next_step_profile = (
+                        self.global_steps + 1 in self.config.global_profiler.steps
+                        if self.config.global_profiler.steps is not None
+                        else False
+                    )
+                    self._stop_profiling(
+                        curr_step_profile and not next_step_profile
+                        if self.config.global_profiler.profile_continuous_steps
+                        else curr_step_profile
+                    )
+                    prev_step_profile = curr_step_profile
+                    curr_step_profile = next_step_profile
+
+                # === 7. 日志记录与清理 ===
+                metrics.update(compute_data_metrics(batch=training_batch, use_critic=self.use_critic))
+                metrics.update(compute_timing_metrics(batch=training_batch, timing_raw=timing_raw))
+                n_gpus = self.resource_pool_manager.get_n_gpus()
+                metrics.update(compute_throughout_metrics(batch=training_batch, timing_raw=timing_raw, n_gpus=n_gpus))
+                
+                timing_raw = defaultdict(float)
+                metrics["train/num_gen_batches"] = num_gen_batches
+                training_batch = None
+                num_prompt_in_batch = 0
+                num_gen_batches = 0
+
+                logger.log(data=metrics, step=self.global_steps)
+
+                if is_last_step:
+                    pprint(f"Final validation metrics: {last_val_metrics}")
+                    progress_bar.close()
                     return
                 
-                # 更新进度条和步数
                 progress_bar.update(1)
                 self.global_steps += 1
                 self.gen_steps += 1

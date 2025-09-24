@@ -2305,8 +2305,6 @@ class RayPPOTrainer(object):
             ground_truth_mask = torch.zeros_like(responses)
             ground_truth_mask[:, start:start + ground_truth_ids.shape[-1]] = 1 # Suppose the response is <think> ABC </think> <answer> DEF </answer>. Then the mask is on " DEF ".
 
-
-
             row_dict = {
                 'prompts': prompts[0],
                 'responses': responses[0],

@@ -31,7 +31,6 @@ def run_gspo_ib(config, compute_score=None):
             runtime_env={"env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN"}},
             num_cpus=config.ray_init.num_cpus,
         )
-
     ray.get(main_task.remote(config, compute_score))
 
 
